@@ -220,6 +220,12 @@ async function getLanguage() {
 
 // Browser window configuration
 function createBrowserWindow(windowState: any): BrowserWindow {
+    const appIconPath = path.join(
+        RESOURCES_PATH,
+        'icons',
+        process.platform === 'win32' ? 'soundcloud-win.ico' : 'soundcloud.png',
+    );
+
     const window = new BrowserWindow({
         width: windowState.width,
         height: windowState.height,
@@ -229,11 +235,7 @@ function createBrowserWindow(windowState: any): BrowserWindow {
         titleBarStyle: process.platform === 'darwin' ? 'hidden' : undefined,
         trafficLightPosition: process.platform === 'darwin' ? { x: 10, y: 10 } : undefined,
         title: 'SoundCloud',
-        icon: path.join(
-            RESOURCES_PATH,
-            'icons',
-            process.platform === 'win32' ? 'soundcloud-win.ico' : 'soundcloud.png',
-        ),
+        icon: appIconPath,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -252,6 +254,17 @@ function createBrowserWindow(windowState: any): BrowserWindow {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
 
     window.webContents.setUserAgent(userAgent);
+
+    if (process.platform === 'win32') {
+        window.setThumbnailToolTip('SoundCloud');
+        window.setAppDetails({
+            appId: 'com.mattwhyy.soundcloud',
+            appIconPath,
+            appIconIndex: 0,
+            relaunchCommand: process.execPath,
+            relaunchDisplayName: 'SoundCloud',
+        });
+    }
 
     const session = window.webContents.session;
     session.webRequest.onBeforeSendHeaders((details, callback) => {
