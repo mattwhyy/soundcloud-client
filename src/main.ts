@@ -60,6 +60,11 @@ const store = new Store({
 
 let isDarkTheme = store.get('theme') !== 'light';
 
+app.setName('SoundCloud');
+if (process.platform === 'win32') {
+    app.setAppUserModelId('com.mattwhyy.soundcloud');
+}
+
 // Global variables
 let mainWindow: BrowserWindow;
 let notificationManager: NotificationManager;
@@ -149,7 +154,7 @@ function setupTray() {
     const trayIcon = icon.resize({ width: 16, height: 16 });
 
     tray = new Tray(trayIcon);
-    tray.setToolTip('SoundCloud RPC');
+    tray.setToolTip('SoundCloud');
 
     // Create tray menu
     const contextMenu = Menu.buildFromTemplate([
@@ -223,6 +228,12 @@ function createBrowserWindow(windowState: any): BrowserWindow {
         frame: process.platform === 'darwin',
         titleBarStyle: process.platform === 'darwin' ? 'hidden' : undefined,
         trafficLightPosition: process.platform === 'darwin' ? { x: 10, y: 10 } : undefined,
+        title: 'SoundCloud',
+        icon: path.join(
+            RESOURCES_PATH,
+            'icons',
+            process.platform === 'win32' ? 'soundcloud-win.ico' : 'soundcloud.png',
+        ),
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
