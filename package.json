@@ -63,7 +63,6 @@
     "devDependencies": {
         "@eslint/eslintrc": "^3.3.1",
         "@eslint/js": "^9.37.0",
-        "@types/discord-rpc": "^4.0.6",
         "@types/node": "^24.2.1",
         "@types/semver": "^7.5.8",
         "@typescript-eslint/eslint-plugin": "^4.33.0",
@@ -81,10 +80,10 @@
         "cpx": "^1.5.0",
         "cross-fetch": "^4.0.0",
         "discord-api-types": "^0.38.18",
-        "discord-rpc": "^4.0.1",
         "electron-prompt": "^1.7.0",
         "electron-store": "^8.1.0",
         "electron-updater": "^6.3.4",
         "electron-window-state": "^5.0.3"
-    }
+    },
+    "packageManager": "pnpm@10.28.2"
 }
