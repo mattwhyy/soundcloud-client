@@ -5,7 +5,7 @@
  * saved override exists, the original stream keeps driving SoundCloud's UI and
  * queue while its audio is muted and a local file is played in sync.
  */
-export const trackOverrideScript = \`
+export const trackOverrideScript = `
 (function() {
     if (window.__soundcloudTrackOverridesLoaded) return;
     window.__soundcloudTrackOverridesLoaded = true;
@@ -23,9 +23,9 @@ export const trackOverrideScript = \`
             const parsed = new URL(value, window.location.origin);
             parsed.search = '';
             parsed.hash = '';
-            return parsed.origin + parsed.pathname.replace(/\\\\/+$/, '');
+            return parsed.origin + parsed.pathname.replace(/\\/+$/, '');
         } catch (_) {
-            return String(value).split('?')[0].split('#')[0].replace(/\\\\/+$/, '');
+            return String(value).split('?')[0].split('#')[0].replace(/\\/+$/, '');
         }
     }
 
@@ -40,8 +40,7 @@ export const trackOverrideScript = \`
     }
 
     function getSoundCloudAudio() {
-        const audios = Array.from(document.querySelectorAll('audio'));
-        return audios.find(audio => audio !== localAudio) || null;
+        return document.querySelector('audio');
     }
 
     function parseTime(value) {
@@ -112,9 +111,9 @@ export const trackOverrideScript = \`
     }
 
     async function activateOverride(trackUrl) {
-        const myToken = ++activationToken;
         stopLocalOverride();
         currentTrackUrl = normalizeUrl(trackUrl);
+        const myToken = activationToken;
 
         if (!currentTrackUrl || !window.soundcloudAPI?.getTrackOverrideAudio) {
             return;
@@ -153,7 +152,6 @@ export const trackOverrideScript = \`
             localObjectUrl = URL.createObjectURL(blob);
             localAudio = new Audio(localObjectUrl);
             localAudio.preload = 'auto';
-            localAudio.dataset.soundcloudLocalOverride = 'true';
 
             attachSourceAudio();
 
@@ -271,4 +269,4 @@ export const trackOverrideScript = \`
 
     refreshCurrentTrack(false);
 })();
-\`;
+`;
