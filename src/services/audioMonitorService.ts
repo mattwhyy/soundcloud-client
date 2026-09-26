@@ -67,7 +67,7 @@ export const audioMonitorScript = `
     const elapsedChanged = trackInfo.elapsed !== currentTrackElapsed;
     const durationChanged = trackInfo.duration !== currentTrackDuration;
     
-    if (stateChanged || trackChanged || elapsedChanged || !window.__initialStateSent) {
+    if (stateChanged || trackChanged || elapsedChanged || durationChanged || !window.__initialStateSent) {
       isCurrentlyPlaying = trackInfo.isPlaying;
       currentTrackTitle = trackInfo.title;
       currentTrackAuthor = trackInfo.author;
