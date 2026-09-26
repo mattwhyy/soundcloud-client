@@ -721,7 +721,7 @@ export const trackOverrideScript = `
         childList: true,
         subtree: true,
         attributes: true,
-        attributeFilter: ['href', 'class', 'style', 'aria-valuenow'],
+        attributeFilter: ['href', 'class'],
     });
 
     window.addEventListener('scroll', scheduleIndicatorRefresh, true);
