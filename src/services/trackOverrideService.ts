@@ -293,6 +293,8 @@ export const trackOverrideScript = `
             isPlaying: localIsPlaying,
             volume: overrideVolume,
         };
+
+        window.dispatchEvent(new CustomEvent('soundcloud-local-override-state'));
     }
 
     function renderLocalTime() {
