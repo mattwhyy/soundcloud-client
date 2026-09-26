@@ -43,6 +43,79 @@ export const trackOverrideScript = `
         return document.querySelector('audio');
     }
 
+    function clampVolume(value) {
+        return Math.max(0, Math.min(1, Number(value) || 0));
+    }
+
+    function getSoundCloudVolume() {
+        const root =
+            document.querySelector('.playControls__volume .volume') ||
+            document.querySelector('.playControls__volume') ||
+            document.querySelector('.volume');
+
+        if (!root) {
+            return sourceAudio && Number.isFinite(sourceAudio.volume)
+                ? clampVolume(sourceAudio.volume)
+                : 1;
+        }
+
+        if (root.classList.contains('muted') || root.getAttribute('data-level') === '0') {
+            return 0;
+        }
+
+        const range =
+            root.querySelector('[role="slider"]') ||
+            root.querySelector('input[type="range"]');
+
+        if (range) {
+            const now = Number(range.getAttribute('aria-valuenow') ?? range.value);
+            const min = Number(range.getAttribute('aria-valuemin') ?? range.min ?? 0);
+            const max = Number(range.getAttribute('aria-valuemax') ?? range.max ?? 100);
+
+            if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
+                return clampVolume((now - min) / (max - min));
+            }
+        }
+
+        const progress = root.querySelector('.volume__sliderProgress');
+        const background = root.querySelector('.volume__sliderBackground');
+
+        if (progress && background) {
+            const progressRect = progress.getBoundingClientRect();
+            const backgroundRect = background.getBoundingClientRect();
+
+            if (backgroundRect.height > 0 && progressRect.height >= 0) {
+                const ratio = progressRect.height / backgroundRect.height;
+                if (Number.isFinite(ratio) && ratio >= 0 && ratio <= 1.05) {
+                    return clampVolume(ratio);
+                }
+            }
+        }
+
+        const handle = root.querySelector('.volume__sliderHandle');
+        if (handle && background) {
+            const handleRect = handle.getBoundingClientRect();
+            const backgroundRect = background.getBoundingClientRect();
+
+            if (backgroundRect.height > 0) {
+                const handleCenter = handleRect.top + handleRect.height / 2;
+                const ratio = 1 - (handleCenter - backgroundRect.top) / backgroundRect.height;
+                if (Number.isFinite(ratio)) {
+                    return clampVolume(ratio);
+                }
+            }
+        }
+
+        const level = Number(root.getAttribute('data-level'));
+        if (Number.isFinite(level)) {
+            return clampVolume(level / 10);
+        }
+
+        return sourceAudio && Number.isFinite(sourceAudio.volume)
+            ? clampVolume(sourceAudio.volume)
+            : 1;
+    }
+
     function parseTime(value) {
         if (!value) return 0;
         return String(value)
@@ -106,7 +179,7 @@ export const trackOverrideScript = `
         sourceAudio.muted = true;
 
         if (localAudio) {
-            localAudio.volume = sourceAudioWasMuted ? 0 : Math.max(0, Math.min(1, sourceAudio.volume));
+            localAudio.volume = getSoundCloudVolume();
         }
     }
 
