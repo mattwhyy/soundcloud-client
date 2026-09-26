@@ -15,23 +15,44 @@ export const audioMonitorScript = `
   let currentTrackDuration = '';
   let elapsedObserver = null;
   
+  function formatSeconds(seconds) {
+    let value = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(value / 3600);
+    value %= 3600;
+    const minutes = Math.floor(value / 60);
+    const secs = value % 60;
+
+    if (hours > 0) {
+      return hours + ':' + String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+    }
+
+    return minutes + ':' + String(secs).padStart(2, '0');
+  }
+
   function getTrackInfo() {
     const playButton = document.querySelector('.playControls__play');
-    const isPlaying = playButton ? playButton.classList.contains('playing') : false;
+    const soundCloudIsPlaying = playButton ? playButton.classList.contains('playing') : false;
     
     const authorEl = document.querySelector('.playbackSoundBadge__lightLink');
     const artworkEl = document.querySelector('.playbackSoundBadge__avatar .image__lightOutline span');
     const elapsedEl = document.querySelector('.playbackTimeline__timePassed span:last-child');
     const durationEl = document.querySelector('.playbackTimeline__duration span:last-child');
     const urlEl = document.querySelector('.playbackSoundBadge__titleLink');
+
+    const overrideState = window.__soundcloudLocalOverrideState;
+    const useOverride = Boolean(
+      overrideState &&
+      overrideState.active &&
+      overrideState.duration > 0
+    );
     
     return {
       title: artworkEl ? artworkEl.getAttribute('aria-label') : '',
       author: authorEl ? authorEl.textContent.trim() : '',
       artwork: artworkEl ? artworkEl.style.backgroundImage.replace(/^url\\(['"]?|['"]?\\)$/g, '') : '',
-      elapsed: elapsedEl ? elapsedEl.textContent.trim() : '',
-      duration: durationEl ? durationEl.textContent.trim() : '',
-      isPlaying: isPlaying,
+      elapsed: useOverride ? formatSeconds(overrideState.position) : (elapsedEl ? elapsedEl.textContent.trim() : ''),
+      duration: useOverride ? formatSeconds(overrideState.duration) : (durationEl ? durationEl.textContent.trim() : ''),
+      isPlaying: useOverride ? Boolean(overrideState.isPlaying) : soundCloudIsPlaying,
       url: urlEl ? urlEl.href.split('?')[0] : ''
     };
   }
@@ -309,6 +330,10 @@ export const audioMonitorScript = `
     }
   });
   
+  window.addEventListener('soundcloud-local-override-state', () => {
+    notifyPlaybackStateChange();
+  });
+
   // Start monitoring
   if (document.readyState === 'complete' || document.readyState === 'interactive') {
     initialize();
