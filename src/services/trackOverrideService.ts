@@ -250,7 +250,6 @@ export const trackOverrideScript = `
     document.addEventListener('pointerup', () => {
         if (!draggingVolume) return;
         draggingVolume = false;
-        setTimeout(refreshVolumeFromDom, 0);
     }, true);
 
     document.addEventListener('keydown', event => {
@@ -479,33 +478,44 @@ export const trackOverrideScript = `
         });
     }
 
-    function sendSeekUpdate() {
+    function sendSeekUpdate(position) {
         if (!overrideActive || !window.soundcloudAPI || !window.soundcloudAPI.updateTrackOverride) {
             return;
         }
 
-        setTimeout(() => {
-            const position = getSoundCloudPosition();
-            window.soundcloudAPI.updateTrackOverride({
-                position: position,
-                volume: overrideVolume,
-                isPlaying: isSoundCloudPlaying(),
-            });
-        }, 80);
+        const nextPosition = Math.max(
+            0,
+            Math.min(localDuration > 0 ? localDuration : Number.MAX_SAFE_INTEGER, Number(position) || 0)
+        );
+
+        localPosition = nextPosition;
+        syncGlobalOverrideState();
+        renderLocalTime();
+
+        window.soundcloudAPI.updateTrackOverride({
+            position: nextPosition,
+            volume: overrideVolume,
+            isPlaying: isSoundCloudPlaying(),
+        });
     }
 
     document.addEventListener('click', event => {
-        if (!overrideActive) return;
+        if (!overrideActive || localDuration <= 0) return;
 
         const target = event.target instanceof Element ? event.target : null;
         if (!target) return;
 
-        if (
-            target.closest('.waveform') ||
-            target.closest('.playbackTimeline')
-        ) {
-            sendSeekUpdate();
-        }
+        const seekSurface =
+            target.closest('.playbackTimeline') ||
+            target.closest('.waveform');
+
+        if (!seekSurface) return;
+
+        const rect = seekSurface.getBoundingClientRect();
+        if (rect.width <= 0 || !Number.isFinite(event.clientX)) return;
+
+        const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+        sendSeekUpdate(ratio * localDuration);
     }, true);
 
     if (window.soundcloudAPI && window.soundcloudAPI.onTrackOverrideStatus) {
