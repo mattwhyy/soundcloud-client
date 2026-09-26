@@ -34,6 +34,147 @@ export const trackOverrideScript = `
         return normalizeUrl(link && link.href ? link.href : '');
     }
 
+    function isTrackPageUrl(value) {
+        if (!value) return false;
+
+        try {
+            const parsed = new URL(value, window.location.origin);
+            if (parsed.hostname !== 'soundcloud.com' && parsed.hostname !== 'www.soundcloud.com') {
+                return false;
+            }
+
+            const segments = parsed.pathname.split('/').filter(Boolean);
+            if (segments.length < 2) return false;
+
+            const nonTrackRoots = new Set([
+                'discover',
+                'stream',
+                'you',
+                'search',
+                'charts',
+                'upload',
+                'settings',
+                'messages',
+                'notifications',
+            ]);
+
+            if (nonTrackRoots.has(segments[0].toLowerCase())) return false;
+            if (segments[1].toLowerCase() === 'sets') return false;
+
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function makeOverrideBadge(id, label, fileName, compact) {
+        const badge = document.createElement('span');
+        badge.id = id;
+        badge.textContent = label;
+        badge.title = fileName ? 'Local override: ' + fileName : 'Local track override';
+        badge.setAttribute('aria-hidden', 'true');
+
+        Object.assign(badge.style, {
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            marginLeft: compact ? '6px' : '10px',
+            padding: compact ? '1px 5px' : '3px 7px',
+            minHeight: compact ? '14px' : '18px',
+            border: '1px solid rgba(255, 85, 0, 0.9)',
+            borderRadius: '999px',
+            background: 'rgba(255, 85, 0, 0.10)',
+            color: '#ff5500',
+            fontSize: compact ? '8px' : '10px',
+            fontWeight: '700',
+            lineHeight: '1',
+            letterSpacing: '0.04em',
+            verticalAlign: 'middle',
+            whiteSpace: 'nowrap',
+            userSelect: 'none',
+            pointerEvents: 'auto',
+        });
+
+        return badge;
+    }
+
+    let indicatorRefreshTimer = null;
+    let indicatorGeneration = 0;
+
+    async function updateOverrideIndicators() {
+        if (!window.soundcloudAPI?.getTrackOverrideInfo) return;
+
+        const generation = ++indicatorGeneration;
+        const playingUrl = getCurrentTrackUrl();
+        const pageUrl = normalizeUrl(window.location.href);
+
+        const [playingInfo, pageInfo] = await Promise.all([
+            playingUrl ? window.soundcloudAPI.getTrackOverrideInfo(playingUrl) : Promise.resolve(null),
+            isTrackPageUrl(pageUrl)
+                ? window.soundcloudAPI.getTrackOverrideInfo(pageUrl)
+                : Promise.resolve(null),
+        ]);
+
+        if (generation !== indicatorGeneration) return;
+
+        const oldPlayerBadge = document.getElementById('soundcloud-local-override-player');
+        if (!playingInfo) {
+            oldPlayerBadge?.remove();
+        } else {
+            const titleLink = document.querySelector('.playbackSoundBadge__titleLink');
+            if (titleLink && !oldPlayerBadge) {
+                const badge = makeOverrideBadge(
+                    'soundcloud-local-override-player',
+                    'LOCAL',
+                    playingInfo.fileName,
+                    true
+                );
+                titleLink.insertAdjacentElement('afterend', badge);
+            } else if (oldPlayerBadge) {
+                oldPlayerBadge.title = playingInfo.fileName
+                    ? 'Local override: ' + playingInfo.fileName
+                    : 'Local track override';
+            }
+        }
+
+        const oldPageBadge = document.getElementById('soundcloud-local-override-page');
+        if (!pageInfo) {
+            oldPageBadge?.remove();
+        } else {
+            const title =
+                document.querySelector('main h1') ||
+                document.querySelector('[role="main"] h1') ||
+                document.querySelector('h1');
+
+            if (title && !oldPageBadge) {
+                const badge = makeOverrideBadge(
+                    'soundcloud-local-override-page',
+                    'LOCAL OVERRIDE',
+                    pageInfo.fileName,
+                    false
+                );
+                title.appendChild(badge);
+            } else if (oldPageBadge) {
+                oldPageBadge.title = pageInfo.fileName
+                    ? 'Local override: ' + pageInfo.fileName
+                    : 'Local track override';
+            }
+        }
+    }
+
+    function scheduleIndicatorRefresh() {
+        if (indicatorRefreshTimer) {
+            clearTimeout(indicatorRefreshTimer);
+        }
+
+        indicatorRefreshTimer = setTimeout(() => {
+            indicatorRefreshTimer = null;
+            updateOverrideIndicators().catch(error => {
+                console.debug('[SoundCloud] Failed to refresh local override indicators:', error);
+            });
+        }, 100);
+    }
+
     function isSoundCloudPlaying() {
         const playButton = document.querySelector('.playControls__play');
         return Boolean(playButton && playButton.classList.contains('playing'));
@@ -318,6 +459,7 @@ export const trackOverrideScript = `
             if (normalized && normalized === getCurrentTrackUrl()) {
                 refreshCurrentTrack(true);
             }
+            scheduleIndicatorRefresh();
         });
     }
 
@@ -326,6 +468,7 @@ export const trackOverrideScript = `
         if (nextUrl && nextUrl !== currentTrackUrl) {
             refreshCurrentTrack(false);
         }
+        scheduleIndicatorRefresh();
     });
 
     observer.observe(document.documentElement, {
@@ -341,5 +484,9 @@ export const trackOverrideScript = `
     });
 
     refreshCurrentTrack(false);
+    scheduleIndicatorRefresh();
+
+    window.addEventListener('popstate', scheduleIndicatorRefresh);
+    window.addEventListener('hashchange', scheduleIndicatorRefresh);
 })();
 `;
