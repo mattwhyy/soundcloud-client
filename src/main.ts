@@ -1211,6 +1211,19 @@ function getMimeType(filePath: string): string {
 
 function setupTrackOverrideHandlers() {
     ipcMain.removeHandler('track-override:get-audio');
+    ipcMain.removeHandler('track-override:get-info');
+
+    ipcMain.handle('track-override:get-info', (_event, rawTrackUrl: string) => {
+        const trackUrl = normalizeTrackUrl(rawTrackUrl);
+        if (!trackUrl) return null;
+
+        const override = getTrackOverrides()[trackUrl];
+        if (!override?.filePath) return null;
+
+        return {
+            fileName: path.basename(override.filePath),
+        };
+    });
 
     ipcMain.handle('track-override:get-audio', async (_event, rawTrackUrl: string) => {
         const trackUrl = normalizeTrackUrl(rawTrackUrl);
@@ -1236,16 +1249,11 @@ function setupTrackOverrideHandlers() {
     });
 
     contentView.webContents.on('context-menu', (_event, params) => {
-        const linkedUrl = normalizeTrackUrl(params.linkURL || '');
-        const currentUrl = normalizeTrackUrl(lastTrackInfo.url || '');
-
-        const trackUrl = isSoundCloudTrackUrl(linkedUrl)
-            ? linkedUrl
-            : isSoundCloudTrackUrl(currentUrl)
-              ? currentUrl
-              : '';
-
-        if (!trackUrl) return;
+        // Only show Track Override actions when the user actually right-clicks
+        // a SoundCloud track link. Do not fall back to the currently playing
+        // track, otherwise the custom menu appears on empty page space.
+        const trackUrl = normalizeTrackUrl(params.linkURL || '');
+        if (!isSoundCloudTrackUrl(trackUrl)) return;
 
         const overrides = getTrackOverrides();
         const hasOverride = Boolean(overrides[trackUrl]?.filePath);
