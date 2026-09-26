@@ -8,4 +8,12 @@ contextBridge.exposeInMainWorld('soundcloudAPI', {
             reason,
         });
     },
+    getTrackOverrideAudio: (trackUrl: string) => {
+        return ipcRenderer.invoke('track-override:get-audio', trackUrl);
+    },
+    onTrackOverrideChanged: (callback: (trackUrl: string) => void) => {
+        ipcRenderer.on('track-override:changed', (_event, trackUrl: string) => {
+            callback(trackUrl);
+        });
+    },
 });
