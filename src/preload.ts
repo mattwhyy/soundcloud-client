@@ -31,4 +31,17 @@ contextBridge.exposeInMainWorld('soundcloudAPI', {
             callback(trackUrl);
         });
     },
+    onTrackOverrideStatus: (
+        callback: (status: {
+            trackUrl: string;
+            position: number;
+            duration: number;
+            isPlaying: boolean;
+            ended: boolean;
+        }) => void,
+    ) => {
+        ipcRenderer.on('track-override:status', (_event, status) => {
+            callback(status);
+        });
+    },
 });
