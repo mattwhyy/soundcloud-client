@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, ipcMain, BrowserView, Tray, nativeImage } from 'electron';
+import { app, BrowserWindow, Menu, ipcMain, BrowserView, Tray, nativeImage, dialog } from 'electron';
 import { ElectronBlocker, fullLists } from '@ghostery/adblocker-electron';
 import { readFileSync, writeFileSync } from 'fs';
 import fetch from 'cross-fetch';
@@ -15,6 +15,7 @@ import { ThemeService } from './services/themeService';
 import { ShortcutService } from './services/shortcutService';
 import { audioMonitorScript } from './services/audioMonitorService';
 import { shuffleFixScript } from './services/shuffleFixService';
+import { trackOverrideScript } from './services/trackOverrideService';
 import type { TrackInfo, TrackUpdateMessage } from './types';
 import path = require('path');
 import { platform } from 'os';
@@ -54,6 +55,7 @@ const store = new Store({
         trackParserEnabled: true,
         richPresencePreviewEnabled: false,
         autoUpdaterEnabled: true,
+        trackOverrides: {},
     },
     clearInvalidConfig: true,
     encryptionKey: 'soundcloud-rpc-config',
@@ -529,6 +531,7 @@ async function init() {
     setupThemeHandlers();
     setupTranslationHandlers();
     setupAudioHandler();
+    setupTrackOverrideHandlers();
 
     // Provide current track info to settings preview on demand
     ipcMain.handle('get-current-track', () => {
@@ -665,6 +668,9 @@ async function init() {
 
             // Fix SoundCloud's limited shuffle queue before injecting the other page helpers.
             await contentView.webContents.executeJavaScript(shuffleFixScript);
+
+            // Enable persistent local audio overrides for selected SoundCloud tracks.
+            await contentView.webContents.executeJavaScript(trackOverrideScript);
 
             // Inject audio monitoring script
             await contentView.webContents.executeJavaScript(audioMonitorScript);
@@ -1120,6 +1126,176 @@ function setupTranslationHandlers() {
             noActivityToShow: translationService.translate('noActivityToShow'),
             richPresencePreviewTitle: translationService.translate('richPresencePreviewTitle'),
         };
+    });
+}
+
+type TrackOverrideRecord = {
+    filePath: string;
+    addedAt: number;
+};
+
+function normalizeTrackUrl(value: string): string {
+    if (!value) return '';
+
+    try {
+        const parsed = new URL(value);
+        parsed.search = '';
+        parsed.hash = '';
+        return parsed.origin + parsed.pathname.replace(/\/+$/, '');
+    } catch {
+        return value.split('?')[0].split('#')[0].replace(/\/+$/, '');
+    }
+}
+
+function isSoundCloudTrackUrl(value: string): boolean {
+    if (!value) return false;
+
+    try {
+        const parsed = new URL(value);
+        if (parsed.hostname !== 'soundcloud.com' && parsed.hostname !== 'www.soundcloud.com') {
+            return false;
+        }
+
+        const segments = parsed.pathname.split('/').filter(Boolean);
+        if (segments.length < 2) return false;
+
+        const nonTrackRoots = new Set([
+            'discover',
+            'stream',
+            'you',
+            'search',
+            'charts',
+            'upload',
+            'settings',
+            'messages',
+            'notifications',
+        ]);
+
+        if (nonTrackRoots.has(segments[0].toLowerCase())) return false;
+        if (segments[1].toLowerCase() === 'sets') return false;
+
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getTrackOverrides(): Record<string, TrackOverrideRecord> {
+    return (store.get('trackOverrides', {}) || {}) as Record<string, TrackOverrideRecord>;
+}
+
+function getMimeType(filePath: string): string {
+    switch (path.extname(filePath).toLowerCase()) {
+        case '.mp3':
+            return 'audio/mpeg';
+        case '.m4a':
+        case '.mp4':
+            return 'audio/mp4';
+        case '.aac':
+            return 'audio/aac';
+        case '.wav':
+            return 'audio/wav';
+        case '.flac':
+            return 'audio/flac';
+        case '.ogg':
+        case '.oga':
+            return 'audio/ogg';
+        case '.opus':
+            return 'audio/ogg; codecs=opus';
+        case '.webm':
+            return 'audio/webm';
+        default:
+            return 'application/octet-stream';
+    }
+}
+
+function setupTrackOverrideHandlers() {
+    ipcMain.removeHandler('track-override:get-audio');
+
+    ipcMain.handle('track-override:get-audio', async (_event, rawTrackUrl: string) => {
+        const trackUrl = normalizeTrackUrl(rawTrackUrl);
+        if (!trackUrl) return null;
+
+        const overrides = getTrackOverrides();
+        const override = overrides[trackUrl];
+        if (!override?.filePath) return null;
+
+        try {
+            const file = readFileSync(override.filePath);
+            const bytes = file.buffer.slice(file.byteOffset, file.byteOffset + file.byteLength);
+
+            return {
+                data: bytes,
+                mimeType: getMimeType(override.filePath),
+                fileName: path.basename(override.filePath),
+            };
+        } catch (error) {
+            console.error('Failed to read local track override:', override.filePath, error);
+            return null;
+        }
+    });
+
+    contentView.webContents.on('context-menu', (_event, params) => {
+        const linkedUrl = normalizeTrackUrl(params.linkURL || '');
+        const currentUrl = normalizeTrackUrl(lastTrackInfo.url || '');
+
+        const trackUrl = isSoundCloudTrackUrl(linkedUrl)
+            ? linkedUrl
+            : isSoundCloudTrackUrl(currentUrl)
+              ? currentUrl
+              : '';
+
+        if (!trackUrl) return;
+
+        const overrides = getTrackOverrides();
+        const hasOverride = Boolean(overrides[trackUrl]?.filePath);
+
+        const template: Electron.MenuItemConstructorOptions[] = [
+            {
+                label: hasOverride ? 'Change local track override…' : 'Use local version…',
+                click: async () => {
+                    const result = await dialog.showOpenDialog(mainWindow, {
+                        title: 'Choose local audio for this SoundCloud track',
+                        properties: ['openFile'],
+                        filters: [
+                            {
+                                name: 'Audio files',
+                                extensions: ['mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'oga', 'opus', 'webm'],
+                            },
+                            { name: 'All files', extensions: ['*'] },
+                        ],
+                    });
+
+                    if (result.canceled || result.filePaths.length === 0) return;
+
+                    const nextOverrides = getTrackOverrides();
+                    nextOverrides[trackUrl] = {
+                        filePath: result.filePaths[0],
+                        addedAt: Date.now(),
+                    };
+                    store.set('trackOverrides', nextOverrides);
+
+                    contentView.webContents.send('track-override:changed', trackUrl);
+                    queueToastNotification('Local track override saved');
+                },
+            },
+        ];
+
+        if (hasOverride) {
+            template.push({
+                label: 'Remove local track override',
+                click: () => {
+                    const nextOverrides = getTrackOverrides();
+                    delete nextOverrides[trackUrl];
+                    store.set('trackOverrides', nextOverrides);
+
+                    contentView.webContents.send('track-override:changed', trackUrl);
+                    queueToastNotification('Local track override removed');
+                },
+            });
+        }
+
+        Menu.buildFromTemplate(template).popup({ window: mainWindow });
     });
 }
 
