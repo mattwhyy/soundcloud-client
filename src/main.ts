@@ -1247,6 +1247,22 @@ const { ipcRenderer } = require('electron');
 const audio = new Audio();
 audio.preload = 'auto';
 
+function reportStatus(ended = false) {
+    ipcRenderer.send('local-override:player-status', {
+        position: Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
+        duration: Number.isFinite(audio.duration) ? audio.duration : 0,
+        isPlaying: !audio.paused && !audio.ended,
+        ended,
+    });
+}
+
+audio.addEventListener('loadedmetadata', () => reportStatus(false));
+audio.addEventListener('durationchange', () => reportStatus(false));
+audio.addEventListener('timeupdate', () => reportStatus(false));
+audio.addEventListener('play', () => reportStatus(false));
+audio.addEventListener('pause', () => reportStatus(false));
+audio.addEventListener('ended', () => reportStatus(true));
+
 let pendingState = {
     position: 0,
     volume: 1,
@@ -1402,6 +1418,28 @@ function setupTrackOverrideHandlers() {
     ipcMain.removeHandler('track-override:start');
     ipcMain.removeHandler('track-override:update');
     ipcMain.removeHandler('track-override:stop');
+    ipcMain.removeAllListeners('local-override:player-status');
+
+    ipcMain.on('local-override:player-status', (event, status: any) => {
+        if (
+            !activeOverrideTrackUrl ||
+            !localOverridePlayer ||
+            localOverridePlayer.isDestroyed() ||
+            event.sender !== localOverridePlayer.webContents ||
+            !contentView ||
+            contentView.webContents.isDestroyed()
+        ) {
+            return;
+        }
+
+        contentView.webContents.send('track-override:status', {
+            trackUrl: activeOverrideTrackUrl,
+            position: Number(status?.position) || 0,
+            duration: Number(status?.duration) || 0,
+            isPlaying: Boolean(status?.isPlaying),
+            ended: Boolean(status?.ended),
+        });
+    });
 
     ipcMain.handle('track-override:get-info', (_event, rawTrackUrl: string) => {
         const trackUrl = normalizeTrackUrl(rawTrackUrl);
