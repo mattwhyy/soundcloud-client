@@ -14,7 +14,7 @@ export const trackOverrideScript = `
     let localAudio = null;
     let localObjectUrl = null;
     let sourceAudio = null;
-    let sourceAudioWasMuted = false;
+    const sourceAudioMuteStates = new Map();
     let activationToken = 0;
 
     function normalizeUrl(value) {
@@ -180,8 +180,41 @@ export const trackOverrideScript = `
         return Boolean(playButton && playButton.classList.contains('playing'));
     }
 
-    function getSoundCloudAudio() {
-        return document.querySelector('audio');
+    function getSoundCloudAudios() {
+        return Array.from(document.querySelectorAll('audio'));
+    }
+
+    function getActiveSoundCloudAudio() {
+        const audios = getSoundCloudAudios();
+
+        return (
+            audios.find(audio => !audio.paused && !audio.ended && audio.currentSrc) ||
+            audios.find(audio => audio.currentSrc && audio.readyState >= 2) ||
+            audios.find(audio => audio.currentSrc) ||
+            audios[0] ||
+            null
+        );
+    }
+
+    function forceMuteSoundCloudAudio(audio) {
+        if (!audio) return;
+
+        if (!sourceAudioMuteStates.has(audio)) {
+            sourceAudioMuteStates.set(audio, audio.muted);
+        }
+
+        // Do not change .volume here. SoundCloud is free to keep updating that
+        // value and we use it as the source of truth for the local override.
+        audio.muted = true;
+    }
+
+    function forceMuteAllSoundCloudAudio() {
+        const audios = getSoundCloudAudios();
+        for (const audio of audios) {
+            forceMuteSoundCloudAudio(audio);
+        }
+
+        sourceAudio = getActiveSoundCloudAudio();
     }
 
     function clampVolume(value) {
@@ -194,9 +227,17 @@ export const trackOverrideScript = `
             document.querySelector('.playControls__volume') ||
             document.querySelector('.volume');
 
+        const activeAudio = getActiveSoundCloudAudio();
+
+        // SoundCloud normally reflects its slider on the active media element.
+        // Prefer that over DOM geometry because the web UI changes frequently.
+        if (activeAudio && Number.isFinite(activeAudio.volume) && activeAudio.volume < 0.999) {
+            return clampVolume(activeAudio.volume);
+        }
+
         if (!root) {
-            return sourceAudio && Number.isFinite(sourceAudio.volume)
-                ? clampVolume(sourceAudio.volume)
+            return activeAudio && Number.isFinite(activeAudio.volume)
+                ? clampVolume(activeAudio.volume)
                 : 1;
         }
 
@@ -252,8 +293,8 @@ export const trackOverrideScript = `
             return clampVolume(level / 10);
         }
 
-        return sourceAudio && Number.isFinite(sourceAudio.volume)
-            ? clampVolume(sourceAudio.volume)
+        return activeAudio && Number.isFinite(activeAudio.volume)
+            ? clampVolume(activeAudio.volume)
             : 1;
     }
 
@@ -266,8 +307,10 @@ export const trackOverrideScript = `
     }
 
     function getSoundCloudPosition() {
-        if (sourceAudio && Number.isFinite(sourceAudio.currentTime)) {
-            return sourceAudio.currentTime;
+        const activeAudio = getActiveSoundCloudAudio();
+        if (activeAudio && Number.isFinite(activeAudio.currentTime)) {
+            sourceAudio = activeAudio;
+            return activeAudio.currentTime;
         }
 
         const elapsed = document.querySelector('.playbackTimeline__timePassed span:last-child');
@@ -275,13 +318,14 @@ export const trackOverrideScript = `
     }
 
     function restoreSourceAudio() {
-        if (sourceAudio) {
+        for (const [audio, wasMuted] of sourceAudioMuteStates.entries()) {
             try {
-                sourceAudio.muted = sourceAudioWasMuted;
+                audio.muted = wasMuted;
             } catch (_) {}
         }
+
+        sourceAudioMuteStates.clear();
         sourceAudio = null;
-        sourceAudioWasMuted = false;
     }
 
     function stopLocalOverride() {
@@ -306,18 +350,9 @@ export const trackOverrideScript = `
     }
 
     function attachSourceAudio() {
-        const nextSourceAudio = getSoundCloudAudio();
-        if (!nextSourceAudio) return;
-
-        if (sourceAudio !== nextSourceAudio) {
-            restoreSourceAudio();
-            sourceAudio = nextSourceAudio;
-            sourceAudioWasMuted = sourceAudio.muted;
-        }
-
-        // Keep SoundCloud running normally for queue state, metadata, seeking,
-        // keyboard controls and Media Session, but silence its actual stream.
-        sourceAudio.muted = true;
+        // SoundCloud may retain or swap multiple audio elements. Muting only one
+        // can leave an older stream faintly audible underneath the override.
+        forceMuteAllSoundCloudAudio();
 
         if (localAudio) {
             localAudio.volume = getSoundCloudVolume();
