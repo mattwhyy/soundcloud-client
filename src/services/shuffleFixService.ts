@@ -1,6 +1,9 @@
 /**
  * Fixes SoundCloud's web player shuffle behavior for large collections.
  *
+ * Adapted from iamnotbobby's MIT-licensed shuffle-fix plugin:
+ * https://github.com/iamnotbobby/soundcloud-rpc/blob/main/plugins/shuffle-fix.js
+ *
  * SoundCloud normally shuffles only the portion of the queue that has already
  * been paginated into memory. This script patches the player queue so that,
  * when shuffle is enabled, the remaining pages are pulled in controlled
