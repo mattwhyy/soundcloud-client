@@ -14,6 +14,7 @@ import { WebhookService } from './services/webhookService';
 import { ThemeService } from './services/themeService';
 import { ShortcutService } from './services/shortcutService';
 import { audioMonitorScript } from './services/audioMonitorService';
+import { shuffleFixScript } from './services/shuffleFixService';
 import type { TrackInfo, TrackUpdateMessage } from './types';
 import path = require('path');
 import { platform } from 'os';
@@ -661,6 +662,9 @@ async function init() {
         try {
             // Reapply theme to content after page reload
             applyThemeToContent(isDarkTheme);
+
+            // Fix SoundCloud's limited shuffle queue before injecting the other page helpers.
+            await contentView.webContents.executeJavaScript(shuffleFixScript);
 
             // Inject audio monitoring script
             await contentView.webContents.executeJavaScript(audioMonitorScript);
