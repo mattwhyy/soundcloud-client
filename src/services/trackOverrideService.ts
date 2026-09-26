@@ -1,9 +1,7 @@
 /**
- * Renderer-side local track override playback.
- *
- * The SoundCloud track remains the authoritative queue/metadata entry. When a
- * saved override exists, the original stream keeps driving SoundCloud's UI and
- * queue while its audio is muted and a local file is played in sync.
+ * Coordinates persistent local track overrides with the main-process isolated
+ * audio player. SoundCloud remains responsible for queue state and metadata,
+ * while Electron mutes the entire SoundCloud view during an override.
  */
 export const trackOverrideScript = `
 (function() {
@@ -11,14 +9,27 @@ export const trackOverrideScript = `
     window.__soundcloudTrackOverridesLoaded = true;
 
     let currentTrackUrl = '';
-    let localAudio = null;
-    let localObjectUrl = null;
-    let sourceAudio = null;
-    const sourceAudioMuteStates = new Map();
+    let overrideActive = false;
+    let overrideFileName = '';
     let activationToken = 0;
+    let handledEndedToken = -1;
+
+    let overrideVolume = 1;
+    let lastNonZeroVolume = 1;
+    let draggingVolume = false;
+
+    let localPosition = 0;
+    let localDuration = 0;
+    let localIsPlaying = false;
+
+    const sourceLoopStates = new Map();
+
+    let indicatorRefreshTimer = null;
+    let indicatorGeneration = 0;
 
     function normalizeUrl(value) {
         if (!value) return '';
+
         try {
             const parsed = new URL(value, window.location.origin);
             parsed.search = '';
@@ -67,6 +78,454 @@ export const trackOverrideScript = `
         }
     }
 
+    function isSoundCloudPlaying() {
+        const playButton = document.querySelector('.playControls__play');
+        return Boolean(playButton && playButton.classList.contains('playing'));
+    }
+
+    function parseTime(value) {
+        if (!value) return 0;
+
+        return String(value)
+            .split(':')
+            .map(part => Number(part) || 0)
+            .reduce((total, part) => total * 60 + part, 0);
+    }
+
+    function formatTime(seconds) {
+        let value = Math.max(0, Math.floor(Number(seconds) || 0));
+        const hours = Math.floor(value / 3600);
+        value %= 3600;
+        const minutes = Math.floor(value / 60);
+        const secs = value % 60;
+
+        if (hours > 0) {
+            return hours + ':' + String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+        }
+
+        return minutes + ':' + String(secs).padStart(2, '0');
+    }
+
+    function getSoundCloudPosition() {
+        const elapsed = document.querySelector('.playbackTimeline__timePassed span:last-child');
+        return parseTime(elapsed ? elapsed.textContent : '');
+    }
+
+    function clampVolume(value) {
+        return Math.max(0, Math.min(1, Number(value) || 0));
+    }
+
+    function getVolumeRoot() {
+        return (
+            document.querySelector('.playControls__volume .volume') ||
+            document.querySelector('.playControls__volume') ||
+            document.querySelector('.volume')
+        );
+    }
+
+    function readVolumeFromDom() {
+        const root = getVolumeRoot();
+        if (!root) return null;
+
+        const rootClass = String(root.className || '').toLowerCase();
+        const button = root.querySelector('button');
+        const buttonLabel = String(
+            (button && button.getAttribute('aria-label')) ||
+            (button && button.getAttribute('title')) ||
+            ''
+        ).toLowerCase();
+
+        if (
+            rootClass.includes('muted') ||
+            root.getAttribute('data-level') === '0' ||
+            buttonLabel.includes('unmute')
+        ) {
+            return 0;
+        }
+
+        const range =
+            root.querySelector('[role="slider"]') ||
+            root.querySelector('input[type="range"]');
+
+        if (range) {
+            const now = Number(range.getAttribute('aria-valuenow') || range.value);
+            const min = Number(range.getAttribute('aria-valuemin') || range.min || 0);
+            const max = Number(range.getAttribute('aria-valuemax') || range.max || 100);
+
+            if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
+                return clampVolume((now - min) / (max - min));
+            }
+        }
+
+        const progress = root.querySelector('.volume__sliderProgress');
+        if (progress) {
+            const inlineHeight = String(progress.style.height || '').trim();
+            if (inlineHeight.endsWith('%')) {
+                const percent = Number.parseFloat(inlineHeight);
+                if (Number.isFinite(percent)) {
+                    return clampVolume(percent / 100);
+                }
+            }
+        }
+
+        const background = root.querySelector('.volume__sliderBackground');
+        if (progress && background) {
+            const progressRect = progress.getBoundingClientRect();
+            const backgroundRect = background.getBoundingClientRect();
+
+            if (backgroundRect.height > 0 && progressRect.height >= 0) {
+                const ratio = progressRect.height / backgroundRect.height;
+                if (Number.isFinite(ratio) && ratio >= 0 && ratio <= 1.05) {
+                    return clampVolume(ratio);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function setOverrideVolume(value) {
+        const next = clampVolume(value);
+        overrideVolume = next;
+        if (next > 0.001) {
+            lastNonZeroVolume = next;
+        }
+    }
+
+    function refreshVolumeFromDom() {
+        const value = readVolumeFromDom();
+        if (value !== null) {
+            setOverrideVolume(value);
+        }
+    }
+
+    function setVolumeFromPointer(event) {
+        const root = getVolumeRoot();
+        if (!root) return false;
+
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target || !target.closest('.volume, .playControls__volume')) {
+            return false;
+        }
+
+        const slider =
+            root.querySelector('.volume__sliderBackground') ||
+            root.querySelector('.volume__sliderWrapper') ||
+            root.querySelector('[role="slider"]');
+
+        if (!slider) return false;
+
+        const rect = slider.getBoundingClientRect();
+        if (rect.height <= 4 || !Number.isFinite(event.clientY)) return false;
+
+        setOverrideVolume(1 - (event.clientY - rect.top) / rect.height);
+        return true;
+    }
+
+    document.addEventListener('pointerdown', event => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target || !target.closest('.volume, .playControls__volume')) return;
+
+        draggingVolume = setVolumeFromPointer(event);
+
+        if (!draggingVolume) {
+            const volumeBefore = overrideVolume;
+            setTimeout(() => {
+                const value = readVolumeFromDom();
+                if (value !== null) {
+                    setOverrideVolume(value);
+                } else {
+                    setOverrideVolume(volumeBefore <= 0.001 ? lastNonZeroVolume : 0);
+                }
+            }, 0);
+        }
+    }, true);
+
+    document.addEventListener('pointermove', event => {
+        if (draggingVolume) {
+            setVolumeFromPointer(event);
+        }
+    }, true);
+
+    document.addEventListener('pointerup', () => {
+        if (!draggingVolume) return;
+        draggingVolume = false;
+        setTimeout(refreshVolumeFromDom, 0);
+    }, true);
+
+    document.addEventListener('keydown', event => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (target && target.closest('.volume, .playControls__volume')) {
+            setTimeout(refreshVolumeFromDom, 0);
+        }
+    }, true);
+
+    function protectSoundCloudFromEnding() {
+        if (!overrideActive) return;
+
+        const audios = Array.from(document.querySelectorAll('audio'));
+        for (const audio of audios) {
+            if (!sourceLoopStates.has(audio)) {
+                sourceLoopStates.set(audio, Boolean(audio.loop));
+            }
+
+            audio.loop = true;
+        }
+    }
+
+    function restoreSoundCloudLoopState() {
+        for (const [audio, originalLoop] of sourceLoopStates.entries()) {
+            try {
+                audio.loop = originalLoop;
+            } catch (_) {}
+        }
+
+        sourceLoopStates.clear();
+    }
+
+    function syncGlobalOverrideState() {
+        window.__soundcloudLocalOverrideState = {
+            active: overrideActive,
+            trackUrl: currentTrackUrl,
+            fileName: overrideFileName,
+            position: localPosition,
+            duration: localDuration,
+            isPlaying: localIsPlaying,
+            volume: overrideVolume,
+        };
+    }
+
+    function renderLocalTime() {
+        if (!overrideActive || localDuration <= 0) return;
+
+        const elapsed = document.querySelector('.playbackTimeline__timePassed span:last-child');
+        const duration = document.querySelector('.playbackTimeline__duration span:last-child');
+
+        if (elapsed) elapsed.textContent = formatTime(localPosition);
+        if (duration) duration.textContent = formatTime(localDuration);
+    }
+
+    function currentOverrideState() {
+        return {
+            position: getSoundCloudPosition(),
+            volume: overrideVolume,
+            isPlaying: isSoundCloudPlaying(),
+        };
+    }
+
+    function getRepeatMode() {
+        const repeat = document.querySelector('.repeatControl');
+        if (!repeat) return 'none';
+
+        const classes = String(repeat.className || '');
+        const label = String(
+            repeat.getAttribute('aria-label') ||
+            repeat.getAttribute('title') ||
+            ''
+        ).toLowerCase();
+
+        if (classes.includes('m-one') || label.includes('repeat one')) {
+            return 'one';
+        }
+
+        if (classes.includes('m-all') || classes.includes('m-active') || label.includes('repeat all')) {
+            return 'all';
+        }
+
+        return 'none';
+    }
+
+    async function restartCurrentOverride() {
+        if (!overrideActive || !currentTrackUrl) return;
+
+        const audios = Array.from(document.querySelectorAll('audio'));
+        for (const audio of audios) {
+            try {
+                audio.currentTime = 0;
+            } catch (_) {}
+        }
+
+        localPosition = 0;
+        handledEndedToken = -1;
+
+        const result = await window.soundcloudAPI.startTrackOverride(
+            currentTrackUrl,
+            {
+                position: 0,
+                volume: overrideVolume,
+                isPlaying: true,
+            }
+        );
+
+        overrideActive = Boolean(result && result.active);
+        overrideFileName = (result && result.fileName) || overrideFileName;
+        syncGlobalOverrideState();
+        scheduleIndicatorRefresh();
+    }
+
+    function advanceAfterLocalEnd() {
+        if (!overrideActive) return;
+
+        if (getRepeatMode() === 'one') {
+            restartCurrentOverride().catch(error => {
+                console.error('[SoundCloud] Failed to repeat local override:', error);
+            });
+            return;
+        }
+
+        const nextButton = document.querySelector('.skipControl__next');
+        if (nextButton) {
+            nextButton.click();
+            return;
+        }
+
+        overrideActive = false;
+        overrideFileName = '';
+        restoreSoundCloudLoopState();
+        window.soundcloudAPI.stopTrackOverride();
+        syncGlobalOverrideState();
+        scheduleIndicatorRefresh();
+    }
+
+    async function activateOverride(trackUrl) {
+        const normalized = normalizeUrl(trackUrl);
+        const myToken = ++activationToken;
+
+        restoreSoundCloudLoopState();
+
+        currentTrackUrl = normalized;
+        localPosition = 0;
+        localDuration = 0;
+        localIsPlaying = false;
+        overrideFileName = '';
+        handledEndedToken = -1;
+
+        if (!normalized || !window.soundcloudAPI || !window.soundcloudAPI.startTrackOverride) {
+            overrideActive = false;
+            if (window.soundcloudAPI && window.soundcloudAPI.stopTrackOverride) {
+                window.soundcloudAPI.stopTrackOverride();
+            }
+            syncGlobalOverrideState();
+            scheduleIndicatorRefresh();
+            return;
+        }
+
+        refreshVolumeFromDom();
+
+        try {
+            const result = await window.soundcloudAPI.startTrackOverride(
+                normalized,
+                currentOverrideState()
+            );
+
+            if (myToken !== activationToken) return;
+
+            overrideActive = Boolean(result && result.active);
+            overrideFileName = (result && result.fileName) || '';
+
+            if (overrideActive) {
+                protectSoundCloudFromEnding();
+            }
+
+            syncGlobalOverrideState();
+            scheduleIndicatorRefresh();
+        } catch (error) {
+            console.error('[SoundCloud] Failed to activate local override:', error);
+            overrideActive = false;
+            overrideFileName = '';
+            window.soundcloudAPI.stopTrackOverride();
+            syncGlobalOverrideState();
+            scheduleIndicatorRefresh();
+        }
+    }
+
+    async function refreshCurrentTrack(force) {
+        const nextUrl = getCurrentTrackUrl();
+
+        if (!nextUrl) {
+            if (currentTrackUrl) {
+                activationToken++;
+                currentTrackUrl = '';
+                overrideActive = false;
+                overrideFileName = '';
+                localPosition = 0;
+                localDuration = 0;
+                localIsPlaying = false;
+                restoreSoundCloudLoopState();
+                window.soundcloudAPI.stopTrackOverride();
+                syncGlobalOverrideState();
+                scheduleIndicatorRefresh();
+            }
+            return;
+        }
+
+        if (force || nextUrl !== currentTrackUrl) {
+            await activateOverride(nextUrl);
+        }
+    }
+
+    function sendTransportUpdate() {
+        if (!overrideActive || !window.soundcloudAPI || !window.soundcloudAPI.updateTrackOverride) {
+            return;
+        }
+
+        protectSoundCloudFromEnding();
+
+        window.soundcloudAPI.updateTrackOverride({
+            volume: overrideVolume,
+            isPlaying: isSoundCloudPlaying(),
+        });
+    }
+
+    function sendSeekUpdate() {
+        if (!overrideActive || !window.soundcloudAPI || !window.soundcloudAPI.updateTrackOverride) {
+            return;
+        }
+
+        setTimeout(() => {
+            const position = getSoundCloudPosition();
+            window.soundcloudAPI.updateTrackOverride({
+                position: position,
+                volume: overrideVolume,
+                isPlaying: isSoundCloudPlaying(),
+            });
+        }, 80);
+    }
+
+    document.addEventListener('click', event => {
+        if (!overrideActive) return;
+
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target) return;
+
+        if (
+            target.closest('.waveform') ||
+            target.closest('.playbackTimeline')
+        ) {
+            sendSeekUpdate();
+        }
+    }, true);
+
+    if (window.soundcloudAPI && window.soundcloudAPI.onTrackOverrideStatus) {
+        window.soundcloudAPI.onTrackOverrideStatus(status => {
+            if (!status || normalizeUrl(status.trackUrl) !== currentTrackUrl || !overrideActive) {
+                return;
+            }
+
+            localPosition = Number(status.position) || 0;
+            localDuration = Number(status.duration) || 0;
+            localIsPlaying = Boolean(status.isPlaying);
+
+            syncGlobalOverrideState();
+            renderLocalTime();
+
+            if (status.ended && handledEndedToken !== activationToken) {
+                handledEndedToken = activationToken;
+                advanceAfterLocalEnd();
+            }
+        });
+    }
+
     function makeOverrideBadge(id, label, fileName, compact) {
         const badge = document.createElement('span');
         badge.id = id;
@@ -78,12 +537,12 @@ export const trackOverrideScript = `
             display: 'inline-flex',
             alignItems: 'center',
             justifyContent: 'center',
-            marginLeft: compact ? '6px' : '10px',
+            marginLeft: compact ? '6px' : '0',
             padding: compact ? '1px 5px' : '3px 7px',
             minHeight: compact ? '14px' : '18px',
             border: '1px solid rgba(255, 85, 0, 0.9)',
             borderRadius: '999px',
-            background: 'rgba(255, 85, 0, 0.10)',
+            background: 'rgba(18, 18, 18, 0.92)',
             color: '#ff5500',
             fontSize: compact ? '8px' : '10px',
             fontWeight: '700',
@@ -93,23 +552,62 @@ export const trackOverrideScript = `
             whiteSpace: 'nowrap',
             userSelect: 'none',
             pointerEvents: 'auto',
+            zIndex: '2147483647',
         });
 
         return badge;
     }
 
-    let indicatorRefreshTimer = null;
-    let indicatorGeneration = 0;
+    function findVisibleTrackTitle() {
+        const headings = Array.from(document.querySelectorAll('h1'));
+
+        return headings.find(heading => {
+            const rect = heading.getBoundingClientRect();
+            const style = window.getComputedStyle(heading);
+
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom > 0 &&
+                rect.top < window.innerHeight &&
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                heading.textContent &&
+                heading.textContent.trim().length > 0
+            );
+        }) || null;
+    }
+
+    function positionPageBadge(badge) {
+        const title = findVisibleTrackTitle();
+        if (!title || !badge) return false;
+
+        const rect = title.getBoundingClientRect();
+        const badgeRect = badge.getBoundingClientRect();
+
+        let left = rect.right + 10;
+        if (left + badgeRect.width > window.innerWidth - 12) {
+            left = Math.max(12, rect.left);
+        }
+
+        const top = rect.top + Math.max(0, (rect.height - badgeRect.height) / 2);
+
+        badge.style.left = Math.round(left) + 'px';
+        badge.style.top = Math.round(top) + 'px';
+        return true;
+    }
 
     async function updateOverrideIndicators() {
-        if (!window.soundcloudAPI?.getTrackOverrideInfo) return;
+        if (!window.soundcloudAPI || !window.soundcloudAPI.getTrackOverrideInfo) return;
 
         const generation = ++indicatorGeneration;
         const playingUrl = getCurrentTrackUrl();
         const pageUrl = normalizeUrl(window.location.href);
 
-        const [playingInfo, pageInfo] = await Promise.all([
-            playingUrl ? window.soundcloudAPI.getTrackOverrideInfo(playingUrl) : Promise.resolve(null),
+        const results = await Promise.all([
+            playingUrl
+                ? window.soundcloudAPI.getTrackOverrideInfo(playingUrl)
+                : Promise.resolve(null),
             isTrackPageUrl(pageUrl)
                 ? window.soundcloudAPI.getTrackOverrideInfo(pageUrl)
                 : Promise.resolve(null),
@@ -117,9 +615,12 @@ export const trackOverrideScript = `
 
         if (generation !== indicatorGeneration) return;
 
+        const playingInfo = results[0];
+        const pageInfo = results[1];
+
         const oldPlayerBadge = document.getElementById('soundcloud-local-override-player');
         if (!playingInfo) {
-            oldPlayerBadge?.remove();
+            if (oldPlayerBadge) oldPlayerBadge.remove();
         } else {
             const titleLink = document.querySelector('.playbackSoundBadge__titleLink');
             if (titleLink && !oldPlayerBadge) {
@@ -137,27 +638,31 @@ export const trackOverrideScript = `
             }
         }
 
-        const oldPageBadge = document.getElementById('soundcloud-local-override-page');
-        if (!pageInfo) {
-            oldPageBadge?.remove();
-        } else {
-            const title =
-                document.querySelector('main h1') ||
-                document.querySelector('[role="main"] h1') ||
-                document.querySelector('h1');
+        let pageBadge = document.getElementById('soundcloud-local-override-page');
 
-            if (title && !oldPageBadge) {
-                const badge = makeOverrideBadge(
+        if (!pageInfo) {
+            if (pageBadge) pageBadge.remove();
+        } else {
+            if (!pageBadge) {
+                pageBadge = makeOverrideBadge(
                     'soundcloud-local-override-page',
                     'LOCAL OVERRIDE',
                     pageInfo.fileName,
                     false
                 );
-                title.appendChild(badge);
-            } else if (oldPageBadge) {
-                oldPageBadge.title = pageInfo.fileName
+                pageBadge.style.position = 'fixed';
+                pageBadge.style.marginLeft = '0';
+                document.body.appendChild(pageBadge);
+            } else {
+                pageBadge.title = pageInfo.fileName
                     ? 'Local override: ' + pageInfo.fileName
                     : 'Local track override';
+            }
+
+            if (!positionPageBadge(pageBadge)) {
+                pageBadge.style.display = 'none';
+            } else {
+                pageBadge.style.display = 'inline-flex';
             }
         }
     }
@@ -175,320 +680,7 @@ export const trackOverrideScript = `
         }, 100);
     }
 
-    function isSoundCloudPlaying() {
-        const playButton = document.querySelector('.playControls__play');
-        return Boolean(playButton && playButton.classList.contains('playing'));
-    }
-
-    function getSoundCloudAudios() {
-        return Array.from(document.querySelectorAll('audio'));
-    }
-
-    function getActiveSoundCloudAudio() {
-        const audios = getSoundCloudAudios();
-
-        return (
-            audios.find(audio => !audio.paused && !audio.ended && audio.currentSrc) ||
-            audios.find(audio => audio.currentSrc && audio.readyState >= 2) ||
-            audios.find(audio => audio.currentSrc) ||
-            audios[0] ||
-            null
-        );
-    }
-
-    function forceMuteSoundCloudAudio(audio) {
-        if (!audio) return;
-
-        if (!sourceAudioMuteStates.has(audio)) {
-            sourceAudioMuteStates.set(audio, audio.muted);
-        }
-
-        // Do not change .volume here. SoundCloud is free to keep updating that
-        // value and we use it as the source of truth for the local override.
-        audio.muted = true;
-    }
-
-    function forceMuteAllSoundCloudAudio() {
-        const audios = getSoundCloudAudios();
-        for (const audio of audios) {
-            forceMuteSoundCloudAudio(audio);
-        }
-
-        sourceAudio = getActiveSoundCloudAudio();
-    }
-
-    function clampVolume(value) {
-        return Math.max(0, Math.min(1, Number(value) || 0));
-    }
-
-    function getSoundCloudVolume() {
-        const root =
-            document.querySelector('.playControls__volume .volume') ||
-            document.querySelector('.playControls__volume') ||
-            document.querySelector('.volume');
-
-        const activeAudio = getActiveSoundCloudAudio();
-
-        // SoundCloud normally reflects its slider on the active media element.
-        // Prefer that over DOM geometry because the web UI changes frequently.
-        if (activeAudio && Number.isFinite(activeAudio.volume) && activeAudio.volume < 0.999) {
-            return clampVolume(activeAudio.volume);
-        }
-
-        if (!root) {
-            return activeAudio && Number.isFinite(activeAudio.volume)
-                ? clampVolume(activeAudio.volume)
-                : 1;
-        }
-
-        if (root.classList.contains('muted') || root.getAttribute('data-level') === '0') {
-            return 0;
-        }
-
-        const range =
-            root.querySelector('[role="slider"]') ||
-            root.querySelector('input[type="range"]');
-
-        if (range) {
-            const now = Number(range.getAttribute('aria-valuenow') ?? range.value);
-            const min = Number(range.getAttribute('aria-valuemin') ?? range.min ?? 0);
-            const max = Number(range.getAttribute('aria-valuemax') ?? range.max ?? 100);
-
-            if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
-                return clampVolume((now - min) / (max - min));
-            }
-        }
-
-        const progress = root.querySelector('.volume__sliderProgress');
-        const background = root.querySelector('.volume__sliderBackground');
-
-        if (progress && background) {
-            const progressRect = progress.getBoundingClientRect();
-            const backgroundRect = background.getBoundingClientRect();
-
-            if (backgroundRect.height > 0 && progressRect.height >= 0) {
-                const ratio = progressRect.height / backgroundRect.height;
-                if (Number.isFinite(ratio) && ratio >= 0 && ratio <= 1.05) {
-                    return clampVolume(ratio);
-                }
-            }
-        }
-
-        const handle = root.querySelector('.volume__sliderHandle');
-        if (handle && background) {
-            const handleRect = handle.getBoundingClientRect();
-            const backgroundRect = background.getBoundingClientRect();
-
-            if (backgroundRect.height > 0) {
-                const handleCenter = handleRect.top + handleRect.height / 2;
-                const ratio = 1 - (handleCenter - backgroundRect.top) / backgroundRect.height;
-                if (Number.isFinite(ratio)) {
-                    return clampVolume(ratio);
-                }
-            }
-        }
-
-        const level = Number(root.getAttribute('data-level'));
-        if (Number.isFinite(level)) {
-            return clampVolume(level / 10);
-        }
-
-        return activeAudio && Number.isFinite(activeAudio.volume)
-            ? clampVolume(activeAudio.volume)
-            : 1;
-    }
-
-    function parseTime(value) {
-        if (!value) return 0;
-        return String(value)
-            .split(':')
-            .map(part => Number(part) || 0)
-            .reduce((total, part) => total * 60 + part, 0);
-    }
-
-    function getSoundCloudPosition() {
-        const activeAudio = getActiveSoundCloudAudio();
-        if (activeAudio && Number.isFinite(activeAudio.currentTime)) {
-            sourceAudio = activeAudio;
-            return activeAudio.currentTime;
-        }
-
-        const elapsed = document.querySelector('.playbackTimeline__timePassed span:last-child');
-        return parseTime(elapsed ? elapsed.textContent : '');
-    }
-
-    function restoreSourceAudio() {
-        for (const [audio, wasMuted] of sourceAudioMuteStates.entries()) {
-            try {
-                audio.muted = wasMuted;
-            } catch (_) {}
-        }
-
-        sourceAudioMuteStates.clear();
-        sourceAudio = null;
-    }
-
-    function stopLocalOverride() {
-        activationToken++;
-
-        if (localAudio) {
-            try {
-                localAudio.pause();
-                localAudio.src = '';
-            } catch (_) {}
-        }
-
-        localAudio = null;
-        restoreSourceAudio();
-
-        if (localObjectUrl) {
-            try {
-                URL.revokeObjectURL(localObjectUrl);
-            } catch (_) {}
-        }
-        localObjectUrl = null;
-    }
-
-    function attachSourceAudio() {
-        // SoundCloud may retain or swap multiple audio elements. Muting only one
-        // can leave an older stream faintly audible underneath the override.
-        forceMuteAllSoundCloudAudio();
-
-        if (localAudio) {
-            localAudio.volume = getSoundCloudVolume();
-        }
-    }
-
-    async function activateOverride(trackUrl) {
-        stopLocalOverride();
-        currentTrackUrl = normalizeUrl(trackUrl);
-        const myToken = activationToken;
-
-        if (!currentTrackUrl || !window.soundcloudAPI?.getTrackOverrideAudio) {
-            return;
-        }
-
-        let override;
-        try {
-            override = await window.soundcloudAPI.getTrackOverrideAudio(currentTrackUrl);
-        } catch (error) {
-            console.error('[SoundCloud] Could not load local track override:', error);
-            return;
-        }
-
-        if (myToken !== activationToken || !override || !override.data) {
-            return;
-        }
-
-        try {
-            let bytes;
-            if (override.data instanceof ArrayBuffer) {
-                bytes = new Uint8Array(override.data);
-            } else if (ArrayBuffer.isView(override.data)) {
-                bytes = new Uint8Array(
-                    override.data.buffer,
-                    override.data.byteOffset || 0,
-                    override.data.byteLength
-                );
-            } else {
-                bytes = new Uint8Array(override.data);
-            }
-
-            const blob = new Blob([bytes], {
-                type: override.mimeType || 'application/octet-stream'
-            });
-
-            localObjectUrl = URL.createObjectURL(blob);
-            localAudio = new Audio(localObjectUrl);
-            localAudio.preload = 'auto';
-
-            attachSourceAudio();
-
-            const syncInitialPosition = () => {
-                if (!localAudio) return;
-                const position = getSoundCloudPosition();
-                if (Number.isFinite(position) && position >= 0) {
-                    try {
-                        localAudio.currentTime = Math.min(position, localAudio.duration || position);
-                    } catch (_) {}
-                }
-
-                if (isSoundCloudPlaying()) {
-                    localAudio.play().catch(error => {
-                        console.debug('[SoundCloud] Local override play was deferred:', error);
-                    });
-                }
-            };
-
-            if (localAudio.readyState >= 1) {
-                syncInitialPosition();
-            } else {
-                localAudio.addEventListener('loadedmetadata', syncInitialPosition, { once: true });
-            }
-
-            console.log(
-                '[SoundCloud] Playing local override for',
-                currentTrackUrl,
-                '(' + (override.fileName || 'local file') + ')'
-            );
-        } catch (error) {
-            console.error('[SoundCloud] Failed to initialize local track override:', error);
-            stopLocalOverride();
-        }
-    }
-
-    async function refreshCurrentTrack(force) {
-        const nextUrl = getCurrentTrackUrl();
-        if (!nextUrl) {
-            if (currentTrackUrl) {
-                currentTrackUrl = '';
-                stopLocalOverride();
-            }
-            return;
-        }
-
-        if (force || nextUrl !== currentTrackUrl) {
-            await activateOverride(nextUrl);
-        }
-    }
-
-    // SoundCloud remains the transport/queue authority. Mirror its current
-    // playback state, seek position and volume to the local file.
-    setInterval(() => {
-        const nextUrl = getCurrentTrackUrl();
-
-        if (nextUrl !== currentTrackUrl) {
-            refreshCurrentTrack(false);
-            return;
-        }
-
-        if (!localAudio) return;
-
-        attachSourceAudio();
-
-        const shouldPlay = isSoundCloudPlaying();
-        if (shouldPlay && localAudio.paused && !localAudio.ended) {
-            localAudio.play().catch(() => {});
-        } else if (!shouldPlay && !localAudio.paused) {
-            localAudio.pause();
-        }
-
-        const targetPosition = getSoundCloudPosition();
-        if (
-            Number.isFinite(targetPosition) &&
-            Number.isFinite(localAudio.currentTime) &&
-            Math.abs(localAudio.currentTime - targetPosition) > 1.25
-        ) {
-            try {
-                localAudio.currentTime = Math.min(
-                    targetPosition,
-                    Number.isFinite(localAudio.duration) ? localAudio.duration : targetPosition
-                );
-            } catch (_) {}
-        }
-    }, 250);
-
-    if (window.soundcloudAPI?.onTrackOverrideChanged) {
+    if (window.soundcloudAPI && window.soundcloudAPI.onTrackOverrideChanged) {
         window.soundcloudAPI.onTrackOverrideChanged(changedUrl => {
             const normalized = normalizeUrl(changedUrl);
             if (normalized && normalized === getCurrentTrackUrl()) {
@@ -500,9 +692,16 @@ export const trackOverrideScript = `
 
     const observer = new MutationObserver(() => {
         const nextUrl = getCurrentTrackUrl();
+
         if (nextUrl && nextUrl !== currentTrackUrl) {
             refreshCurrentTrack(false);
         }
+
+        if (overrideActive) {
+            protectSoundCloudFromEnding();
+            renderLocalTime();
+        }
+
         scheduleIndicatorRefresh();
     });
 
@@ -510,18 +709,38 @@ export const trackOverrideScript = `
         childList: true,
         subtree: true,
         attributes: true,
-        attributeFilter: ['href']
+        attributeFilter: ['href', 'class', 'style', 'aria-valuenow'],
     });
+
+    window.addEventListener('scroll', scheduleIndicatorRefresh, true);
+    window.addEventListener('resize', scheduleIndicatorRefresh);
+    window.addEventListener('popstate', scheduleIndicatorRefresh);
+    window.addEventListener('hashchange', scheduleIndicatorRefresh);
 
     window.addEventListener('beforeunload', () => {
         observer.disconnect();
-        stopLocalOverride();
+        restoreSoundCloudLoopState();
+        if (window.soundcloudAPI && window.soundcloudAPI.stopTrackOverride) {
+            window.soundcloudAPI.stopTrackOverride();
+        }
     });
 
+    setInterval(() => {
+        const nextUrl = getCurrentTrackUrl();
+
+        if (nextUrl !== currentTrackUrl) {
+            refreshCurrentTrack(false);
+            return;
+        }
+
+        if (overrideActive) {
+            sendTransportUpdate();
+            renderLocalTime();
+        }
+    }, 200);
+
+    syncGlobalOverrideState();
     refreshCurrentTrack(false);
     scheduleIndicatorRefresh();
-
-    window.addEventListener('popstate', scheduleIndicatorRefresh);
-    window.addEventListener('hashchange', scheduleIndicatorRefresh);
 })();
 `;
