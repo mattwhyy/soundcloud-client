@@ -388,7 +388,8 @@ export const shuffleFixScript = `
                             // Let SoundCloud finish its own state transition, then
                             // replace only the upcoming order with our fair round.
                             await new Promise(resolve => setTimeout(resolve, 60));
-                            applyFairShuffle(queue);
+                            const activeQueue = moduleExports.getQueue?.() || queue;
+                            applyFairShuffle(activeQueue);
 
                             return result;
                         } catch (error) {
