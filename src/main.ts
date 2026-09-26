@@ -1393,11 +1393,21 @@ async function startLocalTrackOverride(
 function updateLocalTrackOverride(state: { position?: number; volume?: number; isPlaying?: boolean }) {
     if (!activeOverrideTrackUrl || !localOverridePlayer || localOverridePlayer.isDestroyed()) return;
 
-    localOverridePlayer.webContents.send('local-override:update', {
-        position: Number(state?.position) || 0,
-        volume: Math.max(0, Math.min(1, Number(state?.volume) || 0)),
-        isPlaying: Boolean(state?.isPlaying),
-    });
+    const update: { position?: number; volume?: number; isPlaying?: boolean } = {};
+
+    if (Number.isFinite(state?.position)) {
+        update.position = Math.max(0, Number(state.position));
+    }
+
+    if (Number.isFinite(state?.volume)) {
+        update.volume = Math.max(0, Math.min(1, Number(state.volume)));
+    }
+
+    if (typeof state?.isPlaying === 'boolean') {
+        update.isPlaying = state.isPlaying;
+    }
+
+    localOverridePlayer.webContents.send('local-override:update', update);
 }
 
 function stopLocalTrackOverride() {
