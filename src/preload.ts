@@ -11,6 +11,9 @@ contextBridge.exposeInMainWorld('soundcloudAPI', {
     getTrackOverrideAudio: (trackUrl: string) => {
         return ipcRenderer.invoke('track-override:get-audio', trackUrl);
     },
+    getTrackOverrideInfo: (trackUrl: string) => {
+        return ipcRenderer.invoke('track-override:get-info', trackUrl);
+    },
     onTrackOverrideChanged: (callback: (trackUrl: string) => void) => {
         ipcRenderer.on('track-override:changed', (_event, trackUrl: string) => {
             callback(trackUrl);
