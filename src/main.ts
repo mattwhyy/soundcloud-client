@@ -23,6 +23,7 @@ import { platform } from 'os';
 const Store = require('electron-store');
 const { autoUpdater } = require('electron-updater');
 const windowStateManager = require('electron-window-state');
+const { pathToFileURL } = require('url');
 
 export const RESOURCES_PATH = app.isPackaged
     ? path.join(process.resourcesPath, 'assets')
@@ -81,6 +82,9 @@ let thumbarService: ThumbarService;
 let themeService: ThemeService;
 let shortcutService: ShortcutService;
 let tray: Tray | null = null;
+let localOverridePlayer: BrowserWindow | null = null;
+let localOverridePlayerReady: Promise<void> | null = null;
+let activeOverrideTrackUrl = '';
 let isQuitting = false;
 const devMode = process.argv.includes('--dev');
 // Header height for header BrowserView
@@ -1043,6 +1047,12 @@ app.on('activate', function () {
 
 app.on('before-quit', () => {
     isQuitting = true;
+    stopLocalTrackOverride();
+    if (localOverridePlayer && !localOverridePlayer.isDestroyed()) {
+        localOverridePlayer.destroy();
+        localOverridePlayer = null;
+        localOverridePlayerReady = null;
+    }
     if (shortcutService) {
         shortcutService.destroy();
     }
@@ -1209,9 +1219,189 @@ function getMimeType(filePath: string): string {
     }
 }
 
+
+function ensureLocalOverridePlayer(): Promise<void> {
+    if (localOverridePlayer && !localOverridePlayer.isDestroyed() && localOverridePlayerReady) {
+        return localOverridePlayerReady;
+    }
+
+    localOverridePlayer = new BrowserWindow({
+        show: false,
+        skipTaskbar: true,
+        webPreferences: {
+            nodeIntegration: true,
+            contextIsolation: false,
+            webSecurity: false,
+            backgroundThrottling: false,
+        },
+    });
+
+    const html = `
+<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+const { ipcRenderer } = require('electron');
+
+const audio = new Audio();
+audio.preload = 'auto';
+
+let pendingState = {
+    position: 0,
+    volume: 1,
+    isPlaying: false,
+};
+
+function clampVolume(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 1;
+    return Math.max(0, Math.min(1, number));
+}
+
+function applyState(state) {
+    pendingState = { ...pendingState, ...state };
+    audio.volume = clampVolume(pendingState.volume);
+
+    if (
+        Number.isFinite(pendingState.position) &&
+        Number.isFinite(audio.currentTime) &&
+        Math.abs(audio.currentTime - pendingState.position) > 0.75
+    ) {
+        try {
+            audio.currentTime = Math.max(0, pendingState.position);
+        } catch (_) {}
+    }
+
+    if (pendingState.isPlaying) {
+        audio.play().catch(() => {});
+    } else {
+        audio.pause();
+    }
+}
+
+ipcRenderer.on('local-override:load', (_event, state) => {
+    audio.pause();
+    audio.src = state.fileUrl;
+    audio.load();
+    pendingState = {
+        position: Number(state.position) || 0,
+        volume: clampVolume(state.volume),
+        isPlaying: Boolean(state.isPlaying),
+    };
+
+    const start = () => {
+        try {
+            audio.currentTime = Math.max(0, pendingState.position);
+        } catch (_) {}
+        applyState(pendingState);
+    };
+
+    if (audio.readyState >= 1) {
+        start();
+    } else {
+        audio.addEventListener('loadedmetadata', start, { once: true });
+    }
+});
+
+ipcRenderer.on('local-override:update', (_event, state) => {
+    applyState(state || {});
+});
+
+ipcRenderer.on('local-override:stop', () => {
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    pendingState = {
+        position: 0,
+        volume: 1,
+        isPlaying: false,
+    };
+});
+</script>
+</body>
+</html>`;
+
+    localOverridePlayerReady = localOverridePlayer
+        .loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+        .then(() => undefined);
+
+    localOverridePlayer.on('closed', () => {
+        localOverridePlayer = null;
+        localOverridePlayerReady = null;
+    });
+
+    return localOverridePlayerReady;
+}
+
+async function startLocalTrackOverride(
+    rawTrackUrl: string,
+    state: { position?: number; volume?: number; isPlaying?: boolean },
+) {
+    const trackUrl = normalizeTrackUrl(rawTrackUrl);
+    const override = getTrackOverrides()[trackUrl];
+
+    if (!trackUrl || !override?.filePath) {
+        stopLocalTrackOverride();
+        return null;
+    }
+
+    try {
+        await ensureLocalOverridePlayer();
+
+        if (!localOverridePlayer || localOverridePlayer.isDestroyed()) {
+            return null;
+        }
+
+        activeOverrideTrackUrl = trackUrl;
+        contentView.webContents.setAudioMuted(true);
+
+        localOverridePlayer.webContents.send('local-override:load', {
+            fileUrl: pathToFileURL(override.filePath).href,
+            position: Number(state?.position) || 0,
+            volume: Math.max(0, Math.min(1, Number(state?.volume) || 0)),
+            isPlaying: Boolean(state?.isPlaying),
+        });
+
+        return {
+            active: true,
+            fileName: path.basename(override.filePath),
+        };
+    } catch (error) {
+        console.error('Failed to start local track override:', error);
+        stopLocalTrackOverride();
+        return null;
+    }
+}
+
+function updateLocalTrackOverride(state: { position?: number; volume?: number; isPlaying?: boolean }) {
+    if (!activeOverrideTrackUrl || !localOverridePlayer || localOverridePlayer.isDestroyed()) return;
+
+    localOverridePlayer.webContents.send('local-override:update', {
+        position: Number(state?.position) || 0,
+        volume: Math.max(0, Math.min(1, Number(state?.volume) || 0)),
+        isPlaying: Boolean(state?.isPlaying),
+    });
+}
+
+function stopLocalTrackOverride() {
+    activeOverrideTrackUrl = '';
+
+    if (contentView && !contentView.webContents.isDestroyed()) {
+        contentView.webContents.setAudioMuted(false);
+    }
+
+    if (localOverridePlayer && !localOverridePlayer.isDestroyed()) {
+        localOverridePlayer.webContents.send('local-override:stop');
+    }
+}
+
 function setupTrackOverrideHandlers() {
     ipcMain.removeHandler('track-override:get-audio');
     ipcMain.removeHandler('track-override:get-info');
+    ipcMain.removeHandler('track-override:start');
+    ipcMain.removeHandler('track-override:update');
+    ipcMain.removeHandler('track-override:stop');
 
     ipcMain.handle('track-override:get-info', (_event, rawTrackUrl: string) => {
         const trackUrl = normalizeTrackUrl(rawTrackUrl);
@@ -1223,6 +1413,18 @@ function setupTrackOverrideHandlers() {
         return {
             fileName: path.basename(override.filePath),
         };
+    });
+
+    ipcMain.handle('track-override:start', async (_event, rawTrackUrl: string, state: any) => {
+        return startLocalTrackOverride(rawTrackUrl, state || {});
+    });
+
+    ipcMain.handle('track-override:update', (_event, state: any) => {
+        updateLocalTrackOverride(state || {});
+    });
+
+    ipcMain.handle('track-override:stop', () => {
+        stopLocalTrackOverride();
     });
 
     ipcMain.handle('track-override:get-audio', async (_event, rawTrackUrl: string) => {
@@ -1296,6 +1498,10 @@ function setupTrackOverrideHandlers() {
                     const nextOverrides = getTrackOverrides();
                     delete nextOverrides[trackUrl];
                     store.set('trackOverrides', nextOverrides);
+
+                    if (activeOverrideTrackUrl === trackUrl) {
+                        stopLocalTrackOverride();
+                    }
 
                     contentView.webContents.send('track-override:changed', trackUrl);
                     queueToastNotification('Local track override removed');
